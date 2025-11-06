@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "recursive_copy"
-version = "1.0.0"
+version = "1.0.1"
