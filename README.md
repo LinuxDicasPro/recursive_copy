@@ -1,8 +1,10 @@
-# recursive_copy
+<p align="center">
+  <img src="logo.png" width="256">
+</p>
 
-A minimalist, dependency-free library for performing 
-**secure recursive file and directory copies** on **Unix-like systems** — 
-including Linux, BSDs, and Solaris. Designed for simplicity, safety, and stability.
+<h2 align="center">
+recursive_copy - A minimalist, dependency-free library for performing secure
+recursive file and directory copies on Unix-like systems</h2> 
 
 ## ✨ Features
 
