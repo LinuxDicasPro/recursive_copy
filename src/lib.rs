@@ -1,26 +1,27 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, copy};
 use std::os::unix::fs::{self as unix_fs, PermissionsExt};
 use std::path::{Path, PathBuf};
+use walkdir_minimal::{WalkDir, WalkError};
 
 #[derive(Clone, Debug)]
 pub struct CopyOptions {
     pub overwrite: bool,
     pub follow_symlinks: bool,
-    pub create_dest: bool,
+    pub content_only: bool,
     pub buffer_size: usize,
-    pub max_depth: usize,
+    pub depth: usize,
 }
 
 impl Default for CopyOptions {
     fn default() -> Self {
         Self {
-            overwrite: true,
+            overwrite: false,
             follow_symlinks: false,
-            create_dest: true,
-            buffer_size: 8 * 1024,
-            max_depth: 512,
+            content_only: false,
+            buffer_size: 64 * 1024,
+            depth: 512,
         }
     }
 }
@@ -28,6 +29,7 @@ impl Default for CopyOptions {
 #[derive(Debug)]
 pub enum CopyError {
     Io(io::Error),
+    Walk(WalkError),
     DepthExceeded(PathBuf),
     SymlinkLoop(PathBuf),
     SrcNotFound(PathBuf),
@@ -48,7 +50,7 @@ pub fn copy_recursive(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), 
 
     if src.is_file() {
         let dest_path = if dst.is_dir() {
-            dst.join(src.file_name().unwrap())
+            dst.join(src.file_name().unwrap_or_default())
         } else {
             dst.to_path_buf()
         };
@@ -60,103 +62,97 @@ pub fn copy_recursive(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), 
         if dst.exists() && !dst.is_dir() {
             return Err(CopyError::DestNotDir(dst.to_path_buf()));
         }
-        if opts.create_dest {
+
+        let base_dst = if !dst.exists() {
             fs::create_dir_all(dst)?;
+            dst.to_path_buf()
+        } else if opts.content_only {
+            dst.to_path_buf()
+        } else {
+            dst.join(src.file_name().unwrap_or_default())
+        };
+
+        if !base_dst.exists() {
+            fs::create_dir_all(&base_dst)?;
         }
 
         let mut visited = HashSet::new();
-        copy_dir(src, dst, opts, 0, &mut visited)?;
+        walk_and_copy(src, &base_dst, opts, &mut visited)?;
+
         return Ok(());
     }
 
     Err(CopyError::NotSupported(src.to_path_buf()))
 }
 
-fn copy_dir(
+fn walk_and_copy(
     src: &Path,
     dst: &Path,
     opts: &CopyOptions,
-    depth: usize,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<(), CopyError> {
-    if depth > opts.max_depth {
-        return Err(CopyError::DepthExceeded(src.to_path_buf()));
-    }
+    let real_src = src.to_path_buf();
 
-    let real_src = fs::canonicalize(src)?;
     if !visited.insert(real_src.clone()) {
         return Err(CopyError::SymlinkLoop(real_src));
     }
 
-    for entry_res in fs::read_dir(src)? {
-        let entry = entry_res?;
+    let walker = WalkDir::new(src)?.max_depth(opts.depth);
+    for entry_res in walker {
+        let entry = entry_res.map_err(CopyError::Walk)?;
         let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let meta = entry.metadata()?;
+        let rel_part = src_path.strip_prefix(src).unwrap_or(src_path);
+        let dst_path = dst.join(rel_part);
+        let meta = entry.symlink_metadata().map_err(CopyError::Io)?;
 
         if meta.is_dir() {
             if !dst_path.exists() {
                 fs::create_dir_all(&dst_path)?;
             }
-            copy_dir(&src_path, &dst_path, opts, depth + 1, visited)?;
         } else if meta.is_file() {
-            copy_one(&src_path, &dst_path, opts)?;
+            copy_one(src_path, &dst_path, opts)?;
         } else if meta.file_type().is_symlink() {
-            handle_symlink(&src_path, &dst_path, opts, depth, visited)?;
-        } else {
-            eprintln!("Ignoring special file type: {}", src_path.display());
+            if opts.follow_symlinks {
+                let target = fs::read_link(src_path)?;
+                let target_abs = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    src_path.parent().unwrap_or_else(|| Path::new("/")).join(&target)
+                };
+
+                let target_meta = target_abs.symlink_metadata().map_err(CopyError::Io)?;
+                if target_meta.is_file() {
+                    copy_one(&target_abs, &dst_path, opts)?;
+                } else if target_meta.is_dir() {
+                    walk_and_copy(&target_abs, &dst_path, opts, visited)?;
+                }
+            } else {
+                recreate_symlink(src_path, &dst_path, opts)?;
+            }
         }
     }
+    visited.remove(&real_src);
+
     Ok(())
 }
 
-fn handle_symlink(
-    src: &Path,
-    dst: &Path,
-    opts: &CopyOptions,
-    depth: usize,
-    visited: &mut HashSet<PathBuf>,
-) -> Result<(), CopyError> {
-    if opts.follow_symlinks {
-        let target = fs::canonicalize(src)?;
-        if target.is_file() {
-            copy_one(&target, dst, opts)?;
-        } else if target.is_dir() {
-            copy_dir(&target, dst, opts, depth + 1, visited)?;
-        }
-    } else {
-        recreate_symlink(src, dst, opts)?;
-    }
-    Ok(())
-}
 
 fn copy_one(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), CopyError> {
     if dst.exists() {
-        if opts.overwrite {
-            fs::remove_file(dst)?;
-        } else {
+        if !opts.overwrite {
             return Ok(());
         }
+        fs::remove_file(dst)?;
     } else if let Some(p) = dst.parent() {
-        if opts.create_dest {
-            fs::create_dir_all(p)?;
-        }
+        fs::create_dir_all(p)?;
     }
 
     let mut input = fs::File::open(src)?;
     let mut output = fs::File::create(dst)?;
-    let mut buf = vec![0u8; opts.buffer_size];
-
-    loop {
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        output.write_all(&buf[..n])?;
-    }
+    copy(&mut input, &mut output)?;
 
     let mode = fs::metadata(src)?.permissions().mode();
-    let mut perms = fs::metadata(dst)?.permissions();
+    let mut perms = output.metadata()?.permissions();
     perms.set_mode(mode);
     fs::set_permissions(dst, perms)?;
 
@@ -172,6 +168,11 @@ fn recreate_symlink(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), Co
             return Ok(());
         }
     }
+
+    if let Some(p) = dst.parent() {
+        fs::create_dir_all(p)?;
+    }
+
     unix_fs::symlink(&target, dst)?;
     Ok(())
 }
