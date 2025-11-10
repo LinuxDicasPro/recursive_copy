@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/LinuxDicasPro/recursive_copy"
 readme = "README.md"
 keywords = ["cp", "copy", "recursive_copy", "rust", "linux"]
-categories = ["development-tools"]
+categories = ["filesystem"]
 
 [dependencies]
 walkdir_minimal = "1.0"
