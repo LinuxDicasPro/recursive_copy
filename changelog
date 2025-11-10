@@ -1,3 +1,10 @@
+Sun Nov  9 23:30:49 -03 2025:
+    - use walkdir_minimal
+    - restrict symlinks options
+    - content only options
+    - copy root dir by default
+    - restrict special files
+    - other fix security and functions
 Thu Nov  6 19:05:54 -03 2025:
     - remove CopySumary unnecessary
     - always preserve permissions

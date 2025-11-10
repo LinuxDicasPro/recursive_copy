@@ -1,47 +1,15 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, copy};
-use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+use std::io::copy;
+use std::os::unix::fs::{self as unix_fs, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use walkdir_minimal::{WalkDir, WalkError};
+use walkdir_minimal::WalkDir;
 
-#[derive(Clone, Debug)]
-pub struct CopyOptions {
-    pub overwrite: bool,
-    pub follow_symlinks: bool,
-    pub content_only: bool,
-    pub buffer_size: usize,
-    pub depth: usize,
-}
+pub mod error;
+pub mod options;
 
-impl Default for CopyOptions {
-    fn default() -> Self {
-        Self {
-            overwrite: false,
-            follow_symlinks: false,
-            content_only: false,
-            buffer_size: 64 * 1024,
-            depth: 512,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum CopyError {
-    Io(io::Error),
-    Walk(WalkError),
-    DepthExceeded(PathBuf),
-    SymlinkLoop(PathBuf),
-    SrcNotFound(PathBuf),
-    DestNotDir(PathBuf),
-    NotSupported(PathBuf),
-}
-
-impl From<io::Error> for CopyError {
-    fn from(e: io::Error) -> Self {
-        CopyError::Io(e)
-    }
-}
+pub use error::CopyError;
+pub use options::CopyOptions;
 
 pub fn copy_recursive(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), CopyError> {
     if !src.exists() {
@@ -85,11 +53,7 @@ pub fn copy_recursive(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), 
     Err(CopyError::NotSupported(src.to_path_buf()))
 }
 
-fn walk_and_copy(
-    src: &Path,
-    dst: &Path,
-    opts: &CopyOptions,
-    visited: &mut HashSet<PathBuf>,
+fn walk_and_copy(src: &Path, dst: &Path, opts: &CopyOptions, visited: &mut HashSet<PathBuf>
 ) -> Result<(), CopyError> {
     let real_src = src.to_path_buf();
 
@@ -104,14 +68,19 @@ fn walk_and_copy(
         let rel_part = src_path.strip_prefix(src).unwrap_or(src_path);
         let dst_path = dst.join(rel_part);
         let meta = entry.symlink_metadata().map_err(CopyError::Io)?;
+        let ft = meta.file_type();
 
-        if meta.is_dir() {
+        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
+            continue;
+        }
+
+        if ft.is_dir() {
             if !dst_path.exists() {
                 fs::create_dir_all(&dst_path)?;
             }
-        } else if meta.is_file() {
+        } else if ft.is_file() {
             copy_one(src_path, &dst_path, opts)?;
-        } else if meta.file_type().is_symlink() {
+        } else if ft.is_symlink() {
             if opts.follow_symlinks {
                 let target = fs::read_link(src_path)?;
                 let target_abs = if target.is_absolute() {
@@ -120,10 +89,27 @@ fn walk_and_copy(
                     src_path.parent().unwrap_or_else(|| Path::new("/")).join(&target)
                 };
 
+                if opts.restrict_symlinks {
+                    if let (Ok(base_real), Ok(target_real)) = (src.canonicalize(), target_abs.canonicalize()) {
+                        if !target_real.starts_with(&base_real) {
+                            eprintln!("Skipping symlink outside source {} -> {}",
+                                src_path.display(), target_real.display()
+                            );
+                            continue;
+                        }
+                    }
+                }
+
                 let target_meta = target_abs.symlink_metadata().map_err(CopyError::Io)?;
-                if target_meta.is_file() {
+                let target_ft = target_meta.file_type();
+
+                if target_ft.is_block_device() || target_ft.is_char_device() || target_ft.is_fifo() || target_ft.is_socket() {
+                    continue;
+                }
+
+                if target_ft.is_file() {
                     copy_one(&target_abs, &dst_path, opts)?;
-                } else if target_meta.is_dir() {
+                } else if target_ft.is_dir() {
                     walk_and_copy(&target_abs, &dst_path, opts, visited)?;
                 }
             } else {
@@ -132,7 +118,6 @@ fn walk_and_copy(
         }
     }
     visited.remove(&real_src);
-
     Ok(())
 }
 
@@ -151,7 +136,7 @@ fn copy_one(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<(), CopyError>
     let mut output = fs::File::create(dst)?;
     copy(&mut input, &mut output)?;
 
-    let mode = fs::metadata(src)?.permissions().mode();
+    let mode = fs::metadata(src)?.permissions().mode() & 0o777;
     let mut perms = output.metadata()?.permissions();
     perms.set_mode(mode);
     fs::set_permissions(dst, perms)?;
